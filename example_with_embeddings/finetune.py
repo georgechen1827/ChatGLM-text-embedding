@@ -2,6 +2,8 @@
 # from torch.utils.tensorboard import SummaryWriter
 from typing import Optional, Tuple
 
+from torch.optim._multi_tensor import AdamW
+from torch.utils.data import SequentialSampler, DistributedSampler
 from transformers import TrainingArguments, DataCollatorForSeq2Seq
 from transformers import Trainer, HfArgumentParser
 from transformers import AutoTokenizer, AutoModel
@@ -47,7 +49,7 @@ def embedding_forward(
         device=input_ids.device,
     )
 
-    past_key_values = [torch.permute(i,(0,3,1,2,4)) for i in past_key_values]
+    past_key_values = tuple([i.permute((0,3,1,2,4)).contiguous() for i in past_key_values])
 
     transformer_outputs = self.transformer(
         input_ids=input_ids,
@@ -65,37 +67,46 @@ def embedding_forward(
 
     return hidden_states
 
-
-# class CastOutputToFloat(nn.Sequential):
-#     def forward(self, x):
-#         return super().forward(x).to(torch.float32)
-
-
-# def data_collator(features: list) -> dict:
-#     len_ids = [len(feature["input_ids"]) for feature in features]
-#     longest = max(len_ids)
-#     input_ids = []
-#     labels_list = []
-#     for ids_l, feature in sorted(zip(len_ids, features), key=lambda x: -x[0]):
-#         ids = feature["input_ids"]
-#         seq_len = feature["seq_len"]
-#         labels = (
-#             [-100] * (seq_len - 1) + ids[(seq_len - 1) :] + [-100] * (longest - ids_l)
-#         )
-#         ids = ids + [tokenizer.pad_token_id] * (longest - ids_l)
-#         _ids = torch.LongTensor(ids)
-#         labels_list.append(torch.LongTensor(labels))
-#         input_ids.append(_ids)
-#     input_ids = torch.stack(input_ids)
-#     labels = torch.stack(labels_list)
-#     return {
-#         "input_ids": input_ids,
-#         "labels": labels,
-#     }
-
+def has_length(dataset):
+    """
+    Checks if the dataset implements __len__() and it doesn't raise an error
+    """
+    try:
+        return len(dataset) is not None
+    except TypeError:
+        # TypeError: len() of unsized object
+        return False
 
 class ModifiedTrainer(Trainer):
     cl_temperature = 0.01
+
+    def _get_train_sampler(self) :
+        if self.train_dataset is None or not has_length(self.train_dataset):
+            return None
+
+        generator = None
+        if self.args.world_size <= 1:
+            generator = torch.Generator()
+            # for backwards compatibility, we generate a seed here (which is sampled from a generator seeded with
+            # `args.seed`) if data_seed isn't provided.
+            # Further on in this method, we default to `args.seed` instead.
+            if self.args.data_seed is None:
+                seed = int(torch.empty((), dtype=torch.int64).random_().item())
+            else:
+                seed = self.args.data_seed
+            generator.manual_seed(seed)
+
+        seed = self.args.data_seed if self.args.data_seed is not None else self.args.seed
+
+        if self.args.world_size <= 1:
+            return SequentialSampler(self.train_dataset)
+        else:
+            return DistributedSampler(
+                self.train_dataset,
+                num_replicas=self.args.world_size,
+                rank=self.args.process_index,
+                seed=seed,
+            )
 
     def compute_loss(self, model, inputs, return_outputs=False):
         # for task_id in inputs['task_name']:
@@ -165,7 +176,7 @@ class ModifiedTrainer(Trainer):
         }
         torch.save(saved_params, os.path.join(output_dir, "adapter_model.bin"))
 
-ignore_pad_token_for_loss = True
+ignore_pad_token_for_loss = False
 
 from arguments import ModelArguments
 
@@ -198,7 +209,7 @@ def main():
         task_type=TaskType.CAUSAL_LM,
         num_virtual_tokens=8,
         # encoder_hidden_size=8,
-        prefix_projection=True
+        prefix_projection=False
     )
     model = get_peft_model(model, peft_config)
 
@@ -214,8 +225,10 @@ def main():
         model=model,
         label_pad_token_id=label_pad_token_id,
         pad_to_multiple_of=None,
-        padding=False
+        # padding=False,
     )
+
+    optimizer = AdamW(model.parameters(), lr=training_args.learning_rate, eps=1e-6)
 
     # start train
     trainer = ModifiedTrainer(
@@ -224,6 +237,7 @@ def main():
         args=training_args,
         # callbacks=[TensorBoardCallback(writer)],
         data_collator=data_collator,
+        optimizers=(optimizer, None) # LambdaLR(optimizer,lr_lambda=training_args.learning_rate)),
     )
     checkpoint = None
     if training_args.resume_from_checkpoint is not None:

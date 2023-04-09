@@ -5,6 +5,7 @@ import random
 import sys
 import json
 
+import torch
 from datasets import DatasetDict, Dataset
 from transformers import (
     AutoTokenizer,
@@ -35,7 +36,31 @@ set_seed(2023)
 with open('medi-data/medi-data.json') as f:
     train_examples_raw = json.load(f)
 
+old_train_examples_raw = train_examples_raw
+train_examples_raw = []
+total_n = len(old_train_examples_raw)
+real_batch_size = max(training_args.per_device_train_batch_size,
+                      training_args.per_device_train_batch_size * torch.cuda.device_count())
+# print('real_batch_size: ', real_batch_size,training_args.per_device_train_batch_size,torch.cuda.device_count())
+for idx in range(0, total_n, real_batch_size):
+    local_task_name = old_train_examples_raw[idx]['task_name']
+    cur_batch = []
+    include_batch = True
+    for idx1 in range(idx, min(idx + real_batch_size, total_n)):
+        if not old_train_examples_raw[idx1]['task_name'] == local_task_name:
+            print(f'one batch in task {old_train_examples_raw[idx1]["task_name"]} is skipped')
+            include_batch = False
+            break
+        else:
+            cur_batch.append(old_train_examples_raw[idx1])
+    if include_batch and len(cur_batch) == real_batch_size:
+        train_examples_raw.append(cur_batch)
 random.shuffle(train_examples_raw)
+train_examples_raw_batch = train_examples_raw
+train_examples_raw = []
+for b in train_examples_raw_batch:
+    train_examples_raw += b
+print(f'There are {len(train_examples_raw)} pairs to train in total')
 
 train_examples = {'query': [], 'pos': [], 'neg': [], 'task_name': []}
 task_name_map = {}
